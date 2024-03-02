@@ -695,7 +695,8 @@ where
     {
         let addr: AddrKind = addr.into();
         let bytes = Self::write_request(buf, addr).await?;
-        Ok(self.socket.send(&bytes).await?)
+        let header_len = bytes.len() - buf.len();
+        Ok(self.socket.send(&bytes).await? - header_len)
     }
 
     async fn read_response(
