@@ -6,6 +6,7 @@
 
 use std::{
     fmt::Debug,
+    future::Future,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     string::FromUtf8Error,
@@ -699,6 +700,34 @@ where
         Ok(self.socket.send(&bytes).await? - header_len)
     }
 
+    pub fn poll_send_to<A>(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        addr: A,
+    ) -> std::task::Poll<Result<usize>>
+    where
+        A: Into<AddrKind>,
+    {
+        use std::task::ready;
+        ready!(self.socket.poll_send_ready(cx));
+        let addr: AddrKind = addr.into();
+        let mut fut = Box::pin(Self::write_request(buf, addr));
+        loop {
+            match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(Ok(bytes)) => {
+                    let header_len = bytes.len() - buf.len();
+                    let len = ready!(self.socket.poll_send(cx, &bytes))?;
+                    return std::task::Poll::Ready(Ok(len - header_len));
+                }
+                std::task::Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(e));
+                }
+                std::task::Poll::Pending => continue,
+            }
+        }
+    }
+
     async fn read_response(
         len: usize,
         buf: &mut [u8],
@@ -721,6 +750,34 @@ where
         let len = self.socket.recv(&mut bytes).await?;
         let (read, addr) = Self::read_response(len, buf, &mut bytes).await?;
         Ok((read, addr))
+    }
+
+    pub fn poll_recv_from(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<Result<(usize, AddrKind)>> {
+        use std::task::ready;
+        ready!(self.socket.poll_recv_ready(cx))?;
+        let bytes_size = Self::get_buf_size(AddrKind::MAX_SIZE, buf.len());
+        let mut bytes = vec![0; bytes_size];
+        let mut read_buf = tokio::io::ReadBuf::new(bytes.as_mut());
+
+        ready!(self.socket.poll_recv_from(cx, &mut read_buf))?;
+
+        let mut fut = Box::pin(Self::read_response(
+            read_buf.filled().len(),
+            buf,
+            read_buf.filled_mut(),
+        ));
+        loop {
+            match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(res) => {
+                    return std::task::Poll::Ready(res);
+                }
+                std::task::Poll::Pending => continue,
+            }
+        }
     }
 
     fn get_buf_size(addr_size: usize, buf_len: usize) -> usize {
